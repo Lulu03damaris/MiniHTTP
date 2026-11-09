@@ -1,0 +1,5 @@
+*.o
+minihttpd
+httpd
+*.bak
+.DS_Store
