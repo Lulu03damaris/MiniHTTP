@@ -1,16 +1,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <limits.h>
-#include <errno.h>
-#include <sys/stat.h>
+#include <stdbool.h>
+#include <strings.h>
 #include "../include/http.h"
-#include "../include/mime.h"
 #include "../include/files.h"
-
-#define BUFSZ 2048
+#include "../include/server.h"
 
 typedef enum {
     HTTP_METHOD_GET,
@@ -24,96 +19,144 @@ static http_method_t parse_method(const char *method_str) {
     return HTTP_METHOD_UNSUPPORTED;
 }
 
-static void send_response(int fd, int status_code, const char *status_text, const char *content_type, const char *body, long body_len) {
-    char header[BUFSZ];
-    int header_len = snprintf(header, sizeof(header),
-        "HTTP/1.1 %d %s\r\n"
-        "Content-Type: %s\r\n"
-        "Content-Length: %ld\r\n"
-        "Connection: keep-alive\r\n\r\n",
-        status_code, status_text, content_type, body_len);
+static void prepare_error_response(client_conn_t *conn, int status_code, const char *status_text,
+                                   const char *extra_headers, const char *body_html, bool keep_alive) {
+    conn->keep_alive = keep_alive;
+    conn->body_buf = (char *)body_html;
+    conn->body_len = strlen(body_html);
+    conn->body_sent = 0;
+    conn->body_is_dynamic = false;
 
-    if (header_len > 0) {
-        (void)write(fd, header, header_len);
-    }
-    if (body && body_len > 0) {
-        (void)write(fd, body, body_len);
-    }
+    int n = snprintf(conn->resp_hdr, sizeof(conn->resp_hdr),
+        "HTTP/1.1 %d %s\r\n"
+        "%s"
+        "Content-Type: text/html\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: %s\r\n\r\n",
+        status_code, status_text,
+        extra_headers ? extra_headers : "",
+        conn->body_len,
+        conn->keep_alive ? "keep-alive" : "close");
+
+    conn->hdr_len = (n > 0 && (size_t)n < sizeof(conn->resp_hdr)) ? (size_t)n : 0;
+    conn->hdr_sent = 0;
+    conn->writing = true;
 }
 
-void handle_http_request(int client_fd) {
-    char buf[BUFSZ];
-    int nread = read(client_fd, buf, sizeof(buf) - 1);
+static bool check_keep_alive(const char *headers_start, const char *headers_end, const char *protocol) {
+    bool is_http11 = (strcmp(protocol, "HTTP/1.1") == 0);
+    const char *p = headers_start;
 
-    if (nread <= 0) return;
-    buf[nread] = '\0';
+    while (p < headers_end) {
+        const char *line_end = strstr(p, "\r\n");
+        if (!line_end || line_end > headers_end) break;
 
-    char method_str[16];
-    char uri[256];
-    char protocol[16];
-
-    /* 1. SEGURO: Ancho limite en sscanf (%15s, %255s) para evitar Buffer Overflow */
-    if (sscanf(buf, "%15s %255s %15s", method_str, uri, protocol) < 3) {
-        send_response(client_fd, 400, "Bad Request", "text/html", "<h1>400 Bad Request</h1>", 24);
-        return;
+        if (strncasecmp(p, "Connection:", 11) == 0) {
+            const char *val = p + 11;
+            while (val < line_end && (*val == ' ' || *val == '\t')) val++;
+            if (strncasecmp(val, "close", 5) == 0) return false;
+            if (strncasecmp(val, "keep-alive", 10) == 0) return true;
+        }
+        p = line_end + 2;
     }
+    return is_http11;
+}
+
+int handle_http_request(client_conn_t *conn) {
+    conn->req_buf[conn->req_len] = '\0';
+
+    char *headers_end = strstr(conn->req_buf, "\r\n\r\n");
+    if (!headers_end) {
+        if (conn->req_len >= REQ_BUF_SIZE - 1) {
+            prepare_error_response(conn, 400, "Bad Request", NULL, "<h1>400 Request Too Large</h1>", false);
+            return 1;
+        }
+        return 0;
+    }
+
+    size_t total_req_bytes = (size_t)((headers_end + 4) - conn->req_buf);
+
+    char *first_line_end = strstr(conn->req_buf, "\r\n");
+    char *first_space = strchr(conn->req_buf, ' ');
+    if (!first_space || first_space > first_line_end) {
+        prepare_error_response(conn, 400, "Bad Request", NULL, "<h1>400 Bad Request</h1>", false);
+        return 1;
+    }
+
+    char *second_space = strchr(first_space + 1, ' ');
+    if (!second_space || second_space > first_line_end || (second_space - (first_space + 1)) > 255) {
+        prepare_error_response(conn, 400, "Bad Request", NULL, "<h1>400 URI Too Long</h1>", false);
+        return 1;
+    }
+
+    char method_str[16], uri[256], protocol[16];
+    if (sscanf(conn->req_buf, "%15s %255s %15s", method_str, uri, protocol) < 3) {
+        prepare_error_response(conn, 400, "Bad Request", NULL, "<h1>400 Bad Request</h1>", false);
+        return 1;
+    }
+
+    if (strcmp(protocol, "HTTP/1.1") != 0 && strcmp(protocol, "HTTP/1.0") != 0) {
+        prepare_error_response(conn, 400, "Bad Request", NULL, "<h1>400 Bad Request</h1>", false);
+        return 1;
+    }
+
+    bool keep_alive = check_keep_alive(first_line_end + 2, headers_end, protocol);
+
+    size_t remaining = conn->req_len - total_req_bytes;
+    if (remaining > 0) {
+        memmove(conn->req_buf, conn->req_buf + total_req_bytes, remaining);
+    }
+    conn->req_len = remaining;
 
     http_method_t method = parse_method(method_str);
 
     switch (method) {
         case HTTP_METHOD_GET: {
-            char rel_path[256];
+            char *file_buffer = NULL;
+            off_t file_size = 0;
+            const char *mime_type = NULL;
 
-            /* 2. UNIFICADO Y SIN strcpy: Uso seguro de snprintf */
-            if (strcmp(uri, "/") == 0) {
-                snprintf(rel_path, sizeof(rel_path), "/index.html");
-            } else {
-                snprintf(rel_path, sizeof(rel_path), "%s", uri);
-            }
+            int result = read_static_file(uri, &file_buffer, &file_size, &mime_type);
 
-            /* Validar vulnerabilidad de Directory Traversal */
-            char safe_filepath[PATH_MAX];
-            if (!is_safe_path(rel_path, safe_filepath)) {
-                send_response(client_fd, 403, "Forbidden", "text/html", "<h1>403 Forbidden</h1>", 22);
-                return;
-            }
+            if (result == -4) {
+                prepare_error_response(conn, 400, "Bad Request", NULL, "<h1>400 Bad Request</h1>", false);
+            } else if (result == -1) {
+                prepare_error_response(conn, 404, "Not Found", NULL, "<h1>404 Not Found</h1>", keep_alive);
+            } else if (result == -2) {
+                prepare_error_response(conn, 403, "Forbidden", NULL, "<h1>403 Forbidden</h1>", keep_alive);
+            } else if (result == -3) {
+                prepare_error_response(conn, 500, "Internal Server Error", NULL, "<h1>500 Internal Server Error</h1>", false);
+            } else if (result == 0) {
+                conn->keep_alive = keep_alive;
+                conn->body_buf = file_buffer;
+                conn->body_len = (size_t)file_size;
+                conn->body_sent = 0;
+                conn->body_is_dynamic = true;
 
-            /* 3. MANEJO EXPLICITO DE ERRNO: Distinguir entre 404, 403 y 500 */
-            int file_fd = open(safe_filepath, O_RDONLY);
-            if (file_fd < 0) {
-                if (errno == ENOENT) {
-                    send_response(client_fd, 404, "Not Found", "text/html", "<h1>404 Not Found</h1>", 22);
-                } else if (errno == EACCES) {
-                    send_response(client_fd, 403, "Forbidden", "text/html", "<h1>403 Forbidden</h1>", 22);
-                } else {
-                    send_response(client_fd, 500, "Internal Server Error", "text/html", "<h1>500 Internal Server Error</h1>", 34);
+                int n = snprintf(conn->resp_hdr, sizeof(conn->resp_hdr),
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: %s\r\n"
+                    "Content-Length: %zu\r\n"
+                    "Connection: %s\r\n\r\n",
+                    mime_type, conn->body_len,
+                    conn->keep_alive ? "keep-alive" : "close");
+
+                if (n < 0 || (size_t)n >= sizeof(conn->resp_hdr)) {
+                    free(file_buffer);
+                    prepare_error_response(conn, 500, "Internal Server Error", NULL, "<h1>500 Internal Server Error</h1>", false);
+                    return 1;
                 }
-                return;
+
+                conn->hdr_len = (size_t)n;
+                conn->hdr_sent = 0;
+                conn->writing = true;
             }
-
-            /* 4. VERIFICAR ARCHIVO REGULAR (Evita EISDIR al intentar leer directorios) */
-            struct stat st;
-            if (fstat(file_fd, &st) < 0 || !S_ISREG(st.st_mode)) {
-                close(file_fd);
-                send_response(client_fd, 403, "Forbidden", "text/html", "<h1>403 Forbidden</h1>", 22);
-                return;
-            }
-
-            /* Transmisión de respuesta exitosa 200 OK */
-            const char *mime = get_mime_type(safe_filepath);
-            send_response(client_fd, 200, "OK", mime, NULL, st.st_size);
-
-            while ((nread = read(file_fd, buf, sizeof(buf))) > 0) {
-                (void)write(client_fd, buf, nread);
-            }
-
-            close(file_fd);
-            break;
+            return 1;
         }
 
         case HTTP_METHOD_UNSUPPORTED:
         default:
-            send_response(client_fd, 405, "Method Not Allowed", "text/html", "<h1>405 Method Not Allowed</h1>", 31);
-            break;
+            prepare_error_response(conn, 405, "Method Not Allowed", "Allow: GET\r\n", "<h1>405 Method Not Allowed</h1>", keep_alive);
+            return 1;
     }
 }
