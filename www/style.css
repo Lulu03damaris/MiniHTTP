@@ -1,1 +1,36 @@
-body { font-family: sans-serif; background: #f4f4f9; color: #333; padding: 2rem; }
+body {
+    font-family: system-ui, -apple-system, sans-serif;
+    background-color: #f0f2f5;
+    color: #1c1e21;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+    margin: 0;
+}
+
+.card {
+    background: #ffffff;
+    padding: 2rem;
+    border-radius: 10px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+    max-width: 500px;
+    text-align: center;
+}
+
+.media-box {
+    margin: 1.5rem 0 0;
+}
+
+.media-box img {
+    max-width: 100%;
+    height: auto;
+    border-radius: 6px;
+    border: 1px solid #ddd;
+}
+
+figcaption {
+    font-size: 0.85rem;
+    color: #606770;
+    margin-top: 0.5rem;
+}
